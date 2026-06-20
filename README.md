@@ -119,6 +119,22 @@ The evaluation report should include:
 - the final strategy used for `output.csv`
 - operational analysis covering model calls, token usage, image usage, approximate cost, runtime, and TPM/RPM considerations
 
+Run sample evaluation from the repository root:
+
+```bash
+python -m code.evaluation.main
+```
+
+This will create `code/evaluation/sample_predictions.csv` and update `code/evaluation/evaluation_report.md` with exact-match metrics.
+
+Run the full production prediction pipeline:
+
+```bash
+python -m code.main --output output.csv --rule-only
+```
+
+This writes `output.csv` for all rows in `dataset/claims.csv` using the rule-based pipeline. If a local LLM model is available, set `--model-path <model_dir>` and omit `--rule-only`.
+
 ---
 
 ## Chat transcript logging

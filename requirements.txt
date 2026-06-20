@@ -1,0 +1,7 @@
+pillow
+torch
+torchvision
+accelerate
+transformers
+safetensors
+sentence-transformers

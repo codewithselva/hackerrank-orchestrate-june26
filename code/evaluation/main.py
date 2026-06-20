@@ -1,138 +1,139 @@
-import sys
-import time
-from collections import Counter
+from __future__ import annotations
+import logging
 from pathlib import Path
+from typing import Dict, List, Sequence
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT / "code"))
+from code.pipeline import ClaimProcessor
+from code.utils import OUTPUT_COLUMNS, load_csv_rows, load_lookup_csv, write_csv_rows
 
-from agent.claim_processor import process_claim
-from utils.csv_io import load_csv, OUTPUT_COLUMNS
+EVALUATION_COLUMNS = [
+    "evidence_standard_met",
+    "issue_type",
+    "object_part",
+    "claim_status",
+    "valid_image",
+    "severity",
+    "risk_flags",
+    "supporting_image_ids",
+]
 
-DATA_DIR = REPO_ROOT / "dataset"
-REPORT_PATH = REPO_ROOT / "code" / "evaluation" / "evaluation_report.md"
-TEST_DATA_PATH = DATA_DIR / "claims.csv"
-SAMPLE_DATA_PATH = DATA_DIR / "sample_claims.csv"
-TOKEN_INPUT_PER_CALL = 1500
-TOKEN_OUTPUT_PER_CALL = 300
-INPUT_COST_PER_1K = 3.0
-OUTPUT_COST_PER_1K = 15.0
+
+def normalize_value(value: str) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
 
 
-def compare_predictions(predicted: dict, expected: dict) -> dict:
+def compare_rows(
+    prediction: Dict[str, str],
+    expected: Dict[str, str],
+    columns: Sequence[str],
+) -> Dict[str, bool]:
     return {
-        "claim_status": predicted.get("claim_status") == expected.get("claim_status"),
-        "issue_type": predicted.get("issue_type") == expected.get("issue_type"),
-        "severity": predicted.get("severity") == expected.get("severity"),
-        "evidence_standard_met": predicted.get("evidence_standard_met") == expected.get("evidence_standard_met"),
+        column: normalize_value(prediction.get(column, ""))
+        == normalize_value(expected.get(column, ""))
+        for column in columns
     }
 
 
-def write_report(content: str) -> None:
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(content, encoding="utf-8")
-
-
-def main() -> None:
-    sample_df = load_csv(str(SAMPLE_DATA_PATH))
-    test_df = load_csv(str(TEST_DATA_PATH))
-    history_df = load_csv(str(DATA_DIR / "user_history.csv"))
-    requirements_df = load_csv(str(DATA_DIR / "evidence_requirements.csv"))
-    history_df = history_df.set_index("user_id")
-
-    predicted = []
-    expected = []
-    model_calls = 0
-    start_time = time.perf_counter()
-
-    for _, row in sample_df.iterrows():
-        row_dict = row.to_dict()
-        predicted_row = process_claim(row_dict, history_df, requirements_df)
-        predicted.append(predicted_row)
-        expected.append({col: row_dict.get(col, "") for col in OUTPUT_COLUMNS})
-        model_calls += 1
-
-    sample_model_calls = model_calls
-    sample_rows = len(sample_df)
-    test_rows = len(test_df)
-    estimated_test_model_calls = test_rows
-    estimated_test_input_tokens = estimated_test_model_calls * TOKEN_INPUT_PER_CALL
-    estimated_test_output_tokens = estimated_test_model_calls * TOKEN_OUTPUT_PER_CALL
-    estimated_test_cost = (
-        estimated_test_input_tokens / 1000 * INPUT_COST_PER_1K
-        + estimated_test_output_tokens / 1000 * OUTPUT_COST_PER_1K
-    )
-
-    duration = time.perf_counter() - start_time
-    field_matches = {"claim_status": 0, "issue_type": 0, "severity": 0, "evidence_standard_met": 0}
-    status_counts = Counter()
-    confusion = Counter()
-    images_processed = 0
-
-    for pred, exp in zip(predicted, expected):
-        comparison = compare_predictions(pred, exp)
-        for field, match in comparison.items():
-            if match:
-                field_matches[field] += 1
-        status_counts[exp["claim_status"]] += 1
-        confusion[(exp["claim_status"], pred["claim_status"])] += 1
-        images_processed += len([p for p in exp["image_paths"].split(";") if p.strip()])
-
-    total = len(predicted)
-    accuracies = {field: field_matches[field] / total for field in field_matches}
-
-    report_lines = [
+def build_evaluation_report(
+    metrics: Dict[str, float],
+    mismatch_examples: List[Dict[str, str]],
+    total_rows: int,
+) -> str:
+    lines: List[str] = [
         "# Evaluation Report",
         "",
-        "## Accuracy",
-        f"Total sample rows: {total}",
+        "## Summary",
+        f"Sample claims processed: {total_rows}",
         "",
-        "| Field | Accuracy |",
-        "|---|---|",
+        "## Metrics",
     ]
-    for field in ["claim_status", "issue_type", "severity", "evidence_standard_met"]:
-        report_lines.append(f"| {field} | {accuracies[field]:.2%} |")
 
-    report_lines.extend([
-        "",
-        "## Claim Status Confusion Matrix",
-        "",
-        "| Expected \ Predicted | supported | contradicted | not_enough_information |",
-        "|---|---|---|---|",
-    ])
+    for column, score in metrics.items():
+        percent = round(score * 100, 1)
+        lines.append(f"- {column}: {percent}% exact match")
 
-    statuses = ["supported", "contradicted", "not_enough_information"]
-    for expected_status in statuses:
-        row = [expected_status]
-        for predicted_status in statuses:
-            row.append(str(confusion[(expected_status, predicted_status)]))
-        report_lines.append(f"| {' | '.join(row)} |")
+    lines.extend(
+        [
+            "",
+            "## Mismatch examples",
+        ]
+    )
 
-    report_lines.extend([
-        "",
-        "## Operational Metrics",
-        f"- Sample model calls: {sample_model_calls}",
-        f"- Estimated sample input tokens: {sample_model_calls * TOKEN_INPUT_PER_CALL}",
-        f"- Estimated sample output tokens: {sample_model_calls * TOKEN_OUTPUT_PER_CALL}",
-        f"- Estimated sample cost: ${sample_model_calls * TOKEN_INPUT_PER_CALL / 1000 * INPUT_COST_PER_1K + sample_model_calls * TOKEN_OUTPUT_PER_CALL / 1000 * OUTPUT_COST_PER_1K:.2f}",
-        f"- Estimated test model calls: {estimated_test_model_calls}",
-        f"- Estimated test input tokens: {estimated_test_input_tokens}",
-        f"- Estimated test output tokens: {estimated_test_output_tokens}",
-        f"- Estimated test cost: ${estimated_test_cost:.2f}",
-        f"- Images processed in sample: {images_processed}",
-        f"- Runtime seconds (sample): {duration:.2f}",
-        "- TPM/RPM considerations: sequential processing with a 0.5s delay in production to reduce the risk of Anthropic rate limit throttling.",
-        "- Batching/caching: no batching is implemented yet; the system is designed to avoid unnecessary repeated calls by processing each claim once.",
-        "- Retry strategy: one retry after a 5-second wait on API error.",
-    ])
+    if not mismatch_examples:
+        lines.append("No mismatches were found for the evaluated columns.")
+    else:
+        for example in mismatch_examples:
+            lines.append("---")
+            lines.append(f"User ID: {example['user_id']}")
+            lines.append(f"Image paths: {example['image_paths']}")
+            lines.append(f"Claim object: {example['claim_object']}")
+            lines.append("Differences:")
+            for diff in example["differences"]:
+                lines.append(f"- {diff}")
 
-    write_report("\n".join(report_lines))
-    print("Evaluation complete")
-    print(f"Accuracy claim_status: {accuracies['claim_status']:.2%}")
-    print(f"Accuracy issue_type: {accuracies['issue_type']:.2%}")
-    print(f"Accuracy severity: {accuracies['severity']:.2%}")
-    print(f"Accuracy evidence_standard_met: {accuracies['evidence_standard_met']:.2%}")
+    return "\n".join(lines)
+
+
+def evaluate_sample() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    root = Path(__file__).resolve().parents[2]
+    sample_path = root / "dataset" / "sample_claims.csv"
+    history_path = root / "dataset" / "user_history.csv"
+    requirements_path = root / "dataset" / "evidence_requirements.csv"
+    predictions_path = root / "code" / "evaluation" / "sample_predictions.csv"
+    report_path = root / "code" / "evaluation" / "evaluation_report.md"
+
+    sample_rows = load_csv_rows(str(sample_path))
+    user_history = load_lookup_csv(str(history_path), "user_id")
+    requirements = load_csv_rows(str(requirements_path))
+    processor = ClaimProcessor(
+        user_history,
+        requirements,
+        image_base_path=sample_path.parent,
+        llm=None,
+        rule_only=True,
+    )
+
+    predictions = [processor.process_claim(row) for row in sample_rows]
+    write_csv_rows(str(predictions_path), predictions, OUTPUT_COLUMNS)
+    logging.info("Wrote sample predictions to %s", predictions_path)
+
+    counts: Dict[str, int] = {column: 0 for column in EVALUATION_COLUMNS}
+    mismatch_examples: List[Dict[str, str]] = []
+
+    for prediction, expected in zip(predictions, sample_rows):
+        comparison = compare_rows(prediction, expected, EVALUATION_COLUMNS)
+        for column, matched in comparison.items():
+            if matched:
+                counts[column] += 1
+        if not all(comparison.values()):
+            differences = [
+                f"{column}: expected={expected.get(column, '')!r}, predicted={prediction.get(column, '')!r}"
+                for column, matched in comparison.items()
+                if not matched
+            ]
+            if len(mismatch_examples) < 10:
+                mismatch_examples.append(
+                    {
+                        "user_id": prediction.get("user_id", ""),
+                        "image_paths": prediction.get("image_paths", ""),
+                        "claim_object": prediction.get("claim_object", ""),
+                        "differences": differences,
+                    }
+                )
+
+    total_rows = len(sample_rows)
+    metrics = {column: counts[column] / total_rows for column in EVALUATION_COLUMNS}
+    report_text = build_evaluation_report(metrics, mismatch_examples, total_rows)
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report_text, encoding="utf-8")
+    logging.info("Wrote evaluation report to %s", report_path)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(evaluate_sample())
